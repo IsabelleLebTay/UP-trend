@@ -1,0 +1,218 @@
+---
+Title: Power analysis to think throuh what species to choose for a MSMSOM
+
+---
+
+```{R library}
+library(wildrtrax)
+library(tidyverse)
+library(unmarked)
+library(parallel)
+# install.packages("remotes")
+remotes::install_github("ABbiodiversity/wildrtrax")
+```
+
+
+```{R }
+detection_data_2015_2023 <- read_csv("0. Data/Raw/BU_Community_-_Counts_-_Understory_Protection_-_2024_-_Dhami_main_report.csv")
+detection_data_2024 <- read_csv("0. Data/Raw/BU_Community_-_Counts_-_Understory_Protection_-_2015_to_2023_-_Charchuk_&_Dhami_main_report.csv")
+transect_info <- read.csv("0. Data/Processed/transects_and_replication.csv")
+```
+
+
+```{R power analysis}
+# Function to prepare WTSP detection data with time since first survey
+prepare_wtsp_data <- function(detection_data_2015_2023, detection_data_2024) {
+  # Combine data
+  detection_data <- rbind(detection_data_2015_2023, detection_data_2024)
+
+  # Get first survey date for each site
+  first_surveys <- detection_data %>%
+    group_by(location) %>%
+    summarize(first_survey = min(as.Date(recording_date_time)))
+
+  # Filter for WTSP and calculate time since first survey
+  wtsp_data <- detection_data %>%
+    filter(species_code == "OVEN") %>%
+    mutate(
+      date = as.Date(recording_date_time),
+      treatment = factor(substr(location, nchar(location) - 1, nchar(location)))
+    ) %>%
+    left_join(first_surveys, by = "location") %>%
+    mutate(
+      years_since_first = as.numeric(date - first_survey) / 365.25,
+      # Create visit number within year-site combination
+      visit_num = ave(date, location, date, FUN = function(x) rank(x, ties.method = "first"))
+    )
+
+  # Get all site-visit combinations (including non-detections)
+  all_visits <- detection_data %>%
+    distinct(location, recording_date_time) %>%
+    mutate(date = as.Date(recording_date_time)) %>%
+    left_join(first_surveys, by = "location") %>%
+    mutate(
+      treatment = factor(substr(location, nchar(location) - 1, nchar(location))),
+      years_since_first = as.numeric(date - first_survey) / 365.25,
+      visit_num = ave(date, location, date, FUN = function(x) rank(x, ties.method = "first"))
+    )
+
+  # Create detection history
+  det_hist <- wtsp_data %>%
+    distinct(location, date) %>%
+    mutate(detected = 1) %>%
+    right_join(all_visits, by = c("location", "date")) %>%
+    mutate(detected = replace_na(detected, 0)) %>%
+    arrange(location, date, visit_num)
+
+  return(det_hist)
+}
+
+# Function to estimate current occupancy model with temporal trend
+fit_occupancy_model <- function(det_hist) {
+  # Reshape data for unmarked
+  n_sites <- n_distinct(det_hist$location)
+  n_surveys <- max(det_hist$visit_num)
+
+  # Create y matrix
+  y_mat <- det_hist %>%
+    select(location, date, visit_num, detected) %>%
+    pivot_wider(
+      id_cols = c(location, date),
+      names_from = visit_num,
+      values_from = detected,
+      names_prefix = "visit_"
+    ) %>%
+    select(starts_with("visit_")) %>%
+    as.matrix()
+
+  # Create site covariates
+  site_covs <- det_hist %>%
+    distinct(location, date, treatment, years_since_first) %>%
+    arrange(location, date)
+
+  # Scale the years_since_first for better model convergence
+  site_covs$years_since_first_scaled <- scale(site_covs$years_since_first)
+
+  # Create unmarkedFrameOccu
+  umf <- unmarkedFrameOccu(
+    y = y_mat,
+    siteCovs = data.frame(
+      years = site_covs$years_since_first_scaled,
+      treatment = site_covs$treatment
+    )
+  )
+
+  # Fit model with temporal trend
+  mod <- occu(~1 ~ years + treatment, data = umf)
+
+  return(list(
+    model = mod,
+    scaling_params = attributes(site_covs$years_since_first_scaled)
+  ))
+}
+
+# Function to simulate data and assess power
+simulate_power <- function(
+    n_sims = 100,
+    n_sites_per_treatment = 20,
+    n_surveys = 3,
+    time_points = seq(0, 8, by = 2), # Time points to simulate (e.g., 0, 2, 4, 6, 8 years)
+    treatments = c("CC", "UP", "OG"),
+    beta_time = 0.3, # Effect size for time trend (per standardized year)
+    beta_treatment = c(0, 0.5, 1), # Effect sizes for treatments
+    p = 0.3, # Detection probability
+    scaling_params = NULL # Scaling parameters from real data
+    ) {
+  results <- list()
+  significant_effects <- data.frame(
+    time = numeric(n_sims),
+    treatment = numeric(n_sims)
+  )
+
+  for (i in 1:n_sims) {
+    # Generate site-time combinations
+    site_covs <- expand.grid(
+      treatment = treatments,
+      time = time_points
+    ) %>%
+      slice(rep(1:n(), each = n_sites_per_treatment))
+
+    # Scale time if scaling parameters provided
+    if (!is.null(scaling_params)) {
+      site_covs$time_scaled <- (site_covs$time - scaling_params$`scaled:center`) /
+        scaling_params$`scaled:scale`
+    } else {
+      site_covs$time_scaled <- scale(site_covs$time)
+    }
+
+    # Calculate occupancy probabilities
+    logit_psi <- beta_treatment[match(site_covs$treatment, treatments)] +
+      beta_time * site_covs$time_scaled
+    psi <- plogis(logit_psi)
+
+    # Generate true occupancy states
+    z <- rbinom(nrow(site_covs), 1, psi)
+
+    # Generate observations
+    y <- matrix(NA, nrow = length(z), ncol = n_surveys)
+    for (j in 1:n_surveys) {
+      y[, j] <- rbinom(length(z), 1, z * p)
+    }
+
+    # Fit model
+    umf <- unmarkedFrameOccu(
+      y = y,
+      siteCovs = data.frame(
+        years = site_covs$time_scaled,
+        treatment = factor(site_covs$treatment)
+      )
+    )
+
+    mod <- occu(~1 ~ years + treatment, data = umf)
+
+    # Extract significance
+    summ <- summary(mod)
+    coef_table <- summ$state[, c("Estimate", "z value", "P(>|z|)")]
+
+    # Store results
+    significant_effects$time[i] <- coef_table["years", "P(>|z|)"] < 0.05
+    significant_effects$treatment[i] <- any(coef_table[grep("treatment", rownames(coef_table)), "P(>|z|)"] < 0.05)
+  }
+
+  # Calculate power
+  results$power <- list(
+    time = mean(significant_effects$time),
+    treatment = mean(significant_effects$treatment)
+  )
+
+  return(results)
+}
+
+# Example usage:
+# First prepare and examine real data
+det_hist <- prepare_wtsp_data(detection_data_2015_2023, detection_data_2024)
+initial_fit <- fit_occupancy_model(det_hist)
+
+# Look at the model results
+print(summary(initial_fit$model))
+
+# Then run power analysis using effect sizes from initial model
+coef_estimates <- coef(initial_fit$model)
+power_results <- simulate_power(
+  n_sims = 100,
+  n_sites_per_treatment = 20, # Adjust based on your actual data
+  n_surveys = 3, # Adjust based on your actual data
+  time_points = seq(0, 8, by = 2), # Simulate up to 8 years from first survey
+  treatments = c("OG", "CC", "UP"),
+  beta_time = coef_estimates["years"], # Use estimated effect
+  beta_treatment = c(
+    0,
+    coef_estimates["treatmentCC"],
+    coef_estimates["treatmentUP"]
+  ),
+  p = 0.3, # Adjust based on initial model
+  scaling_params = initial_fit$scaling_params # Use same scaling as real data
+)
+
+print(power_results)
+```
